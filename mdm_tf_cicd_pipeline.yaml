@@ -1,0 +1,147 @@
+name: $(TeamProject)_$(Build.DefinitionName)_$(SourceBranchName)_CICD_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  - main
+
+parameters:
+  - name: terraformVersion
+    displayName: Terraform version
+    type: string
+    values:
+      - 1.2.8
+      - 1.2.9
+      - 1.3.0
+      - 1.8.0
+    default: 1.8.0
+
+variables:
+  - name: Stage.statefile
+    value: "$(System.TeamProject)_$(Build.DefinitionName)_$(System.StageName)_state.tfstate"
+  - name: Dev.servicearm
+    value: "ce06-Azure-Terraform-dev"
+    #"ce06-Azure-Terraform-dev" this has policies
+  - name: Prod.servicearm
+    value: "ce06-Azure-Terraform-prod"
+
+stages:
+  - stage: build
+    displayName: Build
+    pool:
+      vmImage: windows-latest
+
+    # install aws cli for dns step in terraform config files
+    jobs:
+      # Copying and storing terraform files as artifacts for later use
+      - job: artifact
+        displayName: Publish artifacts
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          # Copies over config files at the root + the two tf modules
+          - task: CopyFiles@2
+            displayName: "Copy terraform files at the root to $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: |
+                main.tf
+                common.tfvars
+                variables.tf
+                outputs.tf
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          - task: CopyFiles@2
+            displayName: "Copy Webapp terraform files to $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/webapp_module/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          - task: CopyFiles@2
+            displayName: "Copy DNS terraform files to $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/dns_module/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+            # shows all files have been copied
+          - script: "tree /f /a"
+            displayName: "Copied files"
+            workingDirectory: $(Build.ArtifactStagingDirectory)
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: drop"
+
+          - template: templates/steps/azdo_git_tag.yaml
+
+  - stage: dev
+    dependsOn: build
+    displayName: "Dev environment"
+    variables:
+      - group: ce06-Azure-Terraform-dev
+      - group: ce06-mdm-aws-cred
+    pool:
+      vmImage: windows-latest
+
+    jobs:
+      - job: iac
+        displayName: Deploy infrastructre
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+            # Downloading the terraform files for the build agent
+          - task: DownloadPipelineArtifact@2
+            displayName: Download artifacts
+            inputs:
+              buildType: current
+              artifactName: drop
+              targetPath: $(Pipeline.Workspace)
+
+          - template: templates/steps/azdo_git_tag.yaml
+            parameters:
+              Folder: $(Pipeline.Workspace)
+
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            displayName: Install terraform
+            inputs:
+              terraformVersion: ${{ parameters.TerraformVersion }}
+
+          - script: |
+              aws configure set aws_access_key_id $(AWS.AccessKey)
+              aws configure set aws_secret_access_key $(AWS.SecretKey)
+              aws configure set default.region $(AWS.Region)
+
+          # Remote Backend
+          - task: TerraformCLI@2
+            displayName: "Terraform init"
+            inputs:
+              command: "init"
+              backendType: "azurerm"
+              provider: "azurerm"
+              workingDirectory: $(Pipeline.Workspace)
+              backendServiceArm: $(Dev.servicearm)
+              backendAzureRmResourceGroupName: $(Tf.ResourceGroup)
+              backendAzureRmStorageAccountName: $(Tf.StorageAccount)
+              backendAzureRmContainerName: $(Tf.StorageContainer)
+              backendAzureRmKey: $(Stage.Statefile)
+              allowTelemetryCollection: false
+
+          - task: TerraformCLI@2
+            displayName: "Terraform plan"
+            inputs:
+              provider: "azurerm"
+              command: "plan"
+              commandOptions: '-input=false -var-file="common.tfvars" -out=plan.tfplan -lock=false'
+              workingDirectory: $(Pipeline.Workspace)
+              # Uses Azure service connection for authorisation, the tf cli will run `az login` using the SC credentials
+              environmentServiceName: $(Dev.servicearm)
+              runAzLogin: true
+              allowTelemetryCollection: false
+
+          # Deploying - applying the tf config files and creating the azure resources
+          - task: TerraformCLI@2
+            displayName: "Terraform apply"
+            inputs:
+              command: "apply"
+              environmentServiceNameAzureRM: $(Dev.servicearm)
+              commandOptions: "-lock=false plan.tfplan"
+              workingDirectory: $(Pipeline.Workspace)
+              allowTelemetryCollection: false
